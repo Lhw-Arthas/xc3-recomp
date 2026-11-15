@@ -40,7 +40,7 @@
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_FEEDBACK, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_FEEDBACK, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_VB_ALIGN, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -103,6 +103,7 @@ static struct {
     int vcls[17];                        // their pool class and pool record, for the census
     void *vpool[17];
     NVNbufferRange vin[16];              // the ranges they were resolved from, under vk_mem_gen vgen
+    uint32_t vraw[16];                   // the guest strides they were bound for (realign_stream repacks by them)
     uint64_t vgen;
     int vb_valid;
     uint8_t support[SUPPORT_BYTES];      // last support buffer and where it lives
@@ -1732,11 +1733,14 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
     if (!k) B.st_valid = 0;
 }
 
+// The scaled scene's composite in cutscenes (scene_widen): this draw's viewport and scissor cover its whole target.
+static int widen_now, widen_prev;
+
 static void record_fixed(VkExec *ex) {
     VkCommandBuffer cb = ex->cb;
     if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
         float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
-        if (ex->has_vp) x = ex->vp[0][0], y = ex->vp[0][1], w = ex->vp[0][2], h = ex->vp[0][3];
+        if (ex->has_vp && !widen_now) x = ex->vp[0][0], y = ex->vp[0][1], w = ex->vp[0][2], h = ex->vp[0][3];
         if (w < 1) w = 1;
         if (h < 1) h = 1;
         VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
@@ -1744,7 +1748,7 @@ static void record_fixed(VkExec *ex) {
         ex->recorded++;
     }
     if (ex->dirty & VK_EXEC_DIRTY_SCISSOR) {
-        VkRect2D r = vk_exec_scissor(ex);
+        VkRect2D r = widen_now ? (VkRect2D){{0, 0}, {ex->pass_w, ex->pass_h}} : vk_exec_scissor(ex);
         vkCmdSetScissorWithCount(cb, 1, &r);
         ex->recorded++;
     }
@@ -1768,6 +1772,119 @@ static void record_fixed(VkExec *ex) {
     ex->dirty = 0;
 }
 
+// Vertex streams that are not 4-byte aligned. Vulkan requires each attribute fetch to be aligned to its format's
+// component size; Maxwell and NVIDIA's driver read unaligned streams as they are, AMD's hardware fetches from the
+// address rounded down. XC3 has both kinds: its depth pre-pass binds some meshes at an address of 2 mod 4 (stride 32,
+// position R32G32B32_SFLOAT), and some G-buffer meshes have stride 34, so every other vertex is two bytes off. On AMD
+// those positions came out two bytes off, the triangles reached w ~ 0 and covered the screen as sheets through the
+// camera (issues #47, #45). A stream whose address is not aligned to its attributes' component size (stream_align) is
+// copied from guest memory into transient memory at an aligned offset, and one whose stride is not is repacked to the
+// next multiple of 4 (prepare_draw gives the draw that stride and moves attribute offsets past the stride with it), as
+// bind_range does for a misaligned uniform block. Streams of 8- and 16-bit attributes are left alone. Left as it is where the pool is device-local or the
+// stream has no size. NVIDIA keeps binding guest memory directly.
+#define VB_REALIGN_MAX (16ull << 20)
+
+// XC3_VB_REALIGN (debug): 0 binds every stream as it is, 1 only copies streams at an unaligned address, 2 (default)
+// also repacks unaligned strides.
+static int realign_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = cfg_get("XC3_VB_REALIGN");
+        m = e && *e ? atoi(e) : 2;
+    }
+    return m;
+}
+
+// The alignment Vulkan asks of stream b: the largest component size among the attributes that read it (4 for packed
+// 32-bit formats). A stream of 16-bit attributes needs only 2: XC3's tree meshes have stride 10 with R16G16B16 and a
+// 4-byte attribute of 8-bit components, which AMD reads correctly as they are; repacking those drew black streaks
+// through the canopy (Windstrong Bluffs, the title screen after Future Redeemed, #45).
+static uint32_t stream_align(const VkExec *ex, int b) {
+    uint32_t need = 1;
+    for (int l = 0; l < 16; l++) {
+        va_st va;
+        memcpy(&va, &ex->pipe.vattr[l], sizeof va);
+        if (!va.fmt || va.stream != (uint32_t)b) continue;
+        VkFormat f = vk_vertex_format((int)va.fmt, NULL);
+        uint32_t c = f >= VK_FORMAT_R8_UNORM && f <= VK_FORMAT_B8G8R8A8_SRGB      ? 1
+                     : f >= VK_FORMAT_R16_UNORM && f <= VK_FORMAT_R16G16B16A16_SFLOAT ? 2
+                     : f >= VK_FORMAT_R64_UINT && f <= VK_FORMAT_R64G64B64A64_SFLOAT ? 8
+                     : f == VK_FORMAT_UNDEFINED                                     ? 1
+                                                                                    : 4;
+        if (c > need) need = c;
+    }
+    return need;
+}
+
+// The stride the draw uses for stream b: rounded up to a multiple of 4 when the stream will be repacked.
+static uint32_t host_stride(const VkExec *ex, int b) {
+    uint32_t st = ex->pipe.vstream[b].stride, need;
+    if (vk_caps.nvidia || !(st % 4) || realign_mode() < 2 || !(st % (need = stream_align(ex, b)))) return st;
+    const NVNbufferRange *r = &ex->vbuf[b];
+    VkMemSpan sp;
+    if (!r->address || !r->size || r->size > VB_REALIGN_MAX || !vk_mem_resolve(r->address, 1, &sp) || sp.alloc)
+        return st;
+    need = need > 4 ? need : 4;
+    return (st + need - 1) / need * need;
+}
+
+// 1 when stream b went into transient memory (buf, off, *n: the size bound); 0: bind the guest memory as it is.
+static int realign_stream(VkExec *ex, int b, const NVNbufferRange *r, const VkMemSpan *sp, uint64_t *n, VkBuffer *buf,
+                          VkDeviceSize *off) {
+    uint32_t st = ex->pipe.vstream[b].stride, hs = host_stride(ex, b);
+    if (vk_caps.nvidia || !realign_mode() || (!(sp->offset % stream_align(ex, b)) && hs == st)) return 0;
+    if (sp->alloc || !r->size || *n > VB_REALIGN_MAX || hs % 4) {
+        warn_once(W_VB_ALIGN, "vertex stream %#llx (stride %u, %llu bytes) is not 4-byte aligned and is bound as it is",
+                  (unsigned long long)r->address, st, (unsigned long long)r->size);
+        return 0;
+    }
+    const uint8_t *src = (const uint8_t *)(uintptr_t)r->address;
+    RS.volatile_ = 1;
+    vk_mem_count(sp->cls, VK_MUSE_CPU_READ, *n);
+    if (hs == st) {
+        memcpy(scratch(ex, *n, buf, off), src, *n);
+    } else {
+        uint64_t count = (*n + st - 1) / st, out = count * hs;
+        uint8_t *dst = scratch(ex, out, buf, off);
+        memset(dst, 0, out);
+        for (uint64_t i = 0; i < count; i++) {
+            uint64_t at = i * st, len = *n - at < st ? *n - at : st;
+            memcpy(dst + i * hs, src + at, len);
+        }
+        *n = out;
+    }
+    vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_VB, *n);
+    return 1;
+}
+
+// The first 24 distinct layouts of repacked streams (guest stride, attribute NVN formats and offsets) go to the log,
+// for reports from GPUs this machine does not have.
+static void log_repacks(const VkExec *ex, const VkPipeState *s) {
+    static uint64_t seen[24];
+    static int nseen;
+    if (nseen >= 24) return;
+    for (int b = 0; b < 16; b++) {
+        uint32_t st = ex->pipe.vstream[b].stride;
+        if (s->vstream[b].stride == st) continue;
+        char line[256];
+        int at = snprintf(line, sizeof line, "stride %u->%u div %u:", st, s->vstream[b].stride, s->vstream[b].divisor);
+        uint64_t h = st * 0x9e3779b97f4a7c15ull;
+        for (int l = 0; l < 16; l++) {
+            va_st va, raw;
+            memcpy(&va, &s->vattr[l], sizeof va), memcpy(&raw, &ex->pipe.vattr[l], sizeof raw);
+            if (!va.fmt || va.stream != (uint32_t)b) continue;
+            h = (h ^ (raw.fmt << 20 | raw.offset)) * 0x100000001b3ull;
+            if (at < (int)sizeof line - 24)
+                at += snprintf(line + at, sizeof line - at, " %d:fmt%#x+%u", l, (unsigned)raw.fmt, (unsigned)raw.offset);
+        }
+        int known = 0;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == h;
+        if (known || nseen >= 24) continue;
+        seen[nseen++] = h;
+        rt_log("vk_exec: vertex stream %#llx repacked, %s", (unsigned long long)ex->vbuf[b].address, line);
+    }
+}
+
 static void bind_vertex_buffers(VkExec *ex) {
     VkBuffer vb[17];
     VkDeviceSize vo[17], vsz[17], vstr[17];
@@ -1779,10 +1896,11 @@ static void bind_vertex_buffers(VkExec *ex) {
     uint64_t gen = vk_mem_gen();
     int same_gen = B.vb_valid && B.vgen == gen;
     for (int b = 0; b < 17; b++) {
-        vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0;
+        vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? host_stride(ex, b) : 0;
         if (b == VK_PIPE_ZERO_BINDING) continue;
         const NVNbufferRange *r = &ex->vbuf[b];
-        if (same_gen && B.vin[b].address == r->address && B.vin[b].size == r->size) {
+        if (same_gen && B.vin[b].address == r->address && B.vin[b].size == r->size && B.vstr[b] == vstr[b] &&
+            B.vraw[b] == ex->pipe.vstream[b].stride) {
             vb[b] = B.vb[b], vo[b] = B.vo[b], vsz[b] = B.vsz[b], vcls[b] = B.vcls[b], vpool[b] = B.vpool[b];
             continue;
         }
@@ -1790,10 +1908,15 @@ static void bind_vertex_buffers(VkExec *ex) {
         if (!r->address || !vk_mem_resolve(r->address, 1, &sp)) continue;
         VK_MEM_USE(sp);
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
+        if (realign_stream(ex, b, r, &sp, &n, &vb[b], &vo[b])) {
+            vsz[b] = n;
+            continue;
+        }
         vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls, vpool[b] = sp.pool;
     }
     memcpy(B.vcls, vcls, sizeof vcls), memcpy(B.vpool, vpool, sizeof vpool);
     memcpy(B.vin, ex->vbuf, sizeof B.vin);
+    for (int b = 0; b < 16; b++) B.vraw[b] = ex->pipe.vstream[b].stride;
     B.vgen = gen;
     if (B.vb_valid && !memcmp(B.vb, vb, sizeof vb) && !memcmp(B.vo, vo, sizeof vo) && !memcmp(B.vsz, vsz, sizeof vsz) &&
         (dyn || !memcmp(B.vstr, vstr, sizeof vstr)))
@@ -2030,6 +2153,11 @@ static int tup_draw(VkExec *ex, const GfxShader *fs) {
     }
     if (role == VK_TUP_FIRST) {
         TU.captured = 0;
+        if (TU.fix.image) {   // the last frame's result found no target of the frame's size and format (tup_fixup)
+            static unsigned missed;
+            if (!missed++ || missed % 600 == 0)
+                rt_log("vk: temporal upscale: the result did not reach the frame (%u frames so far)", missed);
+        }
         TU.fix.image = TU.done.image = VK_NULL_HANDLE;
         if (TU.failed || vk_tup_mode() == VK_TUP_OFF) return 0;
         float c4[12];
@@ -2068,6 +2196,7 @@ static int tup_draw(VkExec *ex, const GfxShader *fs) {
     // The scaled path's output is twice the scene, which the game's copy halves into a scene-size target: the upscaler
     // writes the frame size into an image of its own instead, which tup_fixup brings into the frame.
     TU.f.own_out = res_scene_on();
+    TU.f.game_out = TU.f.own_out ? TU.f.out : (VkTupImage){0};
     if (TU.f.own_out) {
         unsigned out[2], scene[2];
         res_sizes(out, scene);
@@ -2112,6 +2241,33 @@ static void tup_fixup(VkExec *ex) {
     TU.fix.image = VK_NULL_HANDLE;
 }
 
+// On the scaled-scene path (res_scene_on) the game draws the scene into the frame only in some scenes, and then at the
+// scene's size: the real-time scenes of events (Event Theater's prologue; the prologue's first battle of a new game in
+// issue #69) composite it through fragment shaders 3444fa67f4a6dd2e and 75ce7f12a9b636c5 into targets of the frame's
+// size, and Event Theater's menu copies its 3D background (e98d22f95e30dbc6) the same way, each through a viewport of
+// the scene's size at the top left. Nothing stretches that afterwards (tup_fixup only brings in the copy of play), so
+// the scene stayed in the top left corner under a whole interface.
+// Such a draw (into a target of the frame's size, through a viewport at the origin smaller than the frame with the
+// frame's aspect) gets a viewport and scissor of the whole target: its full-screen triangle then samples the scene over
+// all of the frame. The next draw records the game's own viewport and scissor again.
+static void scene_widen(VkExec *ex) {
+    if (widen_prev) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    widen_prev = widen_now = 0;
+    if (!res_scene_on() || !ex->has_vp) return;
+    const VkExecTarget *t = &ex->color[0];
+    unsigned out[2], scene[2];
+    res_sizes(out, scene);
+    if (!t->image || t->width != out[0] || t->height != out[1] || ex->pass_w != out[0] || ex->pass_h != out[1]) return;
+    const float *v = ex->vp[0];
+    double w = v[2], h = v[3];
+    if (v[0] != 0 || v[1] != 0 || w >= out[0] || h >= out[1] || w < out[0] / 4.0 || h < out[1] / 4.0) return;
+    if (fabs(w * out[1] - h * out[0]) > out[0] + out[1]) return;   // not the frame's aspect, to a pixel or so
+    widen_now = widen_prev = 1;
+    ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    static int said;
+    if (!said++) rt_log("vk: scaled scene: a draw of %gx%g into the %ux%u frame is stretched over it", w, h, out[0], out[1]);
+}
+
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
     cb_res(ex);
@@ -2125,6 +2281,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (!ex->in_pass || TU.fix.image) tup_fixup(ex);
     if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
     vk_exec_pass_begin(ex);
+    scene_widen(ex);
     VkRect2D sc = vk_exec_scissor(ex);
     if (!sc.extent.width || !sc.extent.height) return 0;
     if (!ex->bound[NVN_STAGE_VS]) return warn_once(W_PROGRAM, "a draw without a bound vertex program is skipped"), 0;
@@ -2164,6 +2321,19 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (fs && tup_draw(ex, fs)) return 0;
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
+    for (int b = 0; b < 16; b++)   // a stream with a stride that is not a multiple of 4 is repacked (realign_stream)
+        if (s.vstream[b].stride % 4) s.vstream[b].stride = host_stride(ex, b);
+    // An attribute may start past its stream's stride (XC3 reads the next vertex's position at offset 12 of a
+    // stride-12 stream): in a repacked stream that vertex sits hs bytes on, not st.
+    for (int l = 0; l < 16; l++) {
+        va_st va;
+        memcpy(&va, &s.vattr[l], sizeof va);
+        uint32_t st = va.stream < 16 ? ex->pipe.vstream[va.stream].stride : 0;
+        if (!va.fmt || !st || s.vstream[va.stream].stride == st || va.offset < st) continue;
+        va.offset = va.offset / st * s.vstream[va.stream].stride + va.offset % st;
+        memcpy(&s.vattr[l], &va, sizeof va);
+    }
+    log_repacks(ex, &s);
     s.vs = vs, s.fs = fs, s.gs = gs;
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
     s.prim = (uint8_t)prim;

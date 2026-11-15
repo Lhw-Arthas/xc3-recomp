@@ -55,9 +55,10 @@ typedef struct {
     int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (XC3_GPL=0: off)
     int amd;                           // an AMD GPU (vendor 0x1002), any driver
     int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
+    int nvidia;                        // an NVIDIA GPU (vendor 0x10de), any driver
 } VkCaps;
 extern VkCaps vk_caps;
-void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc
+void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc, nvidia
 void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (XC3_VK_NO_FLOAT64 clears shaderFloat64)
 // Before vkCreateDevice, with the driver's graphics pipeline library feature and properties: sets vk_caps.gpl,
 // 1 = enable the extensions (VK_KHR_pipeline_library, VK_EXT_graphics_pipeline_library) and the feature.
@@ -117,6 +118,8 @@ typedef struct {
     VkTupImage color, depth, motion;   // render size, GENERAL: tonemapped colour, depth-stencil, packed motion vectors
     VkTupImage out;                    // output size, GENERAL: where the game's reconstruction writes
     int own_out;                       // 1: the result stays in an image of ours of out's size (vk_tup_result)
+    VkTupImage game_out;               // own_out: the reconstruction's target at its own size, GENERAL; the result is
+                                       // scaled into it too, for the game's passes that read it
     float jitter[2];                   // camera jitter in render pixels, x right and y down
     float near_z, fov_y;               // 0: defaults
     uint32_t rw, rh;                   // the part of color, depth and motion the scene drew (the game's dynamic

@@ -159,6 +159,38 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
     return r;
 }
 
+// ---------- program pins
+// A bind on the hardware records the program's shader addresses, so a recording keeps the shaders it was made with when
+// the game later calls SetShaders on the NVNprogram or finalizes it. Records therefore point at an immutable host copy
+// per program set-up (prog_t.serial), as texture pins do. With the asynchronous replay this lets nvnProgramFinalize
+// return without waiting for the queued submissions (vk_backend.c, vk_be_program_release). A program without shaders
+// (serial 0) binds as one with no stages. The copies are kept for the whole run: about 120 bytes per SetShaders.
+static PlatMutex prog_pin_lock = PLAT_MUTEX_INIT;
+static nvn_hmap prog_pins = {.klen = 8};    // serial -> prog_t copy
+
+static const prog_t *prog_pin(const NVNprogram *np) {
+    const prog_t *p = (const prog_t *)np;
+    if (!p) return NULL;
+    static const prog_t empty = {.magic = NVN_PROG_MAGIC};
+    uint64_t serial = p->serial;
+    if (!serial) return &empty;
+    plat_mutex_lock_shared(&prog_pin_lock);
+    const prog_t *r = nvn_hm_get(&prog_pins, &serial);
+    plat_mutex_unlock_shared(&prog_pin_lock);
+    if (r) return r;
+    plat_mutex_lock(&prog_pin_lock);
+    r = nvn_hm_get(&prog_pins, &serial);
+    if (!r) {
+        prog_t *copy = malloc(sizeof *copy);
+        if (!copy) rt_fatal("nvn: program pin copy");
+        *copy = *p;
+        nvn_hm_put(&prog_pins, &serial, copy);
+        r = copy;
+    }
+    plat_mutex_unlock(&prog_pin_lock);
+    return r;
+}
+
 // ---------- recording copies
 // A handle points just past a copy_prefix. Copies are indexed by the 64 KiB block of their control-memory position, so
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
@@ -615,7 +647,7 @@ NVN_API(nvnCommandBufferSetRenderEnableConditional) {
 }
 // void nvnCommandBufferBindProgram(NVNcommandBuffer *cmd, const NVNprogram *program, int stages)
 NVN_API(nvnCommandBufferBindProgram) {
-    *REC(cmd_of(c), OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){arg_p(c, 1), (int)arg_x(c, 2)};
+    *REC(cmd_of(c), OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){prog_pin(arg_p(c, 1)), (int)arg_x(c, 2)};
 }
 // void nvnCommandBufferBind{Blend,Color,ChannelMask,Multisample,Polygon,DepthStencil}State(NVNcommandBuffer *cmd,
 // const NVN*State *state): the state object's bytes are copied (p_bind_state.kind order)
@@ -689,12 +721,20 @@ NVN_API(nvnCommandBufferBindVertexBuffer) {
 #define UI_CLIP_LR (MOD_MAIN_BASE + 0x10386f0)   // the clip rectangle setter's return address, saved in its frame
 #define UI_FULL_WIDTH 1.9f
 static _Thread_local int ui_on_output, ui_in_rect;
+// The interface renderer also binds a camera, uniform block 1 of the vertex stage, before each run of elements: the
+// identity for the flat layouts (the HUD), a perspective projection for the layouts set up in 3D (the main menu on X,
+// tilted towards the view). That projection's x scale is the game's own, from the frame's real aspect (0.974 at 16:9,
+// 0.725 at 3440x1440), so those elements already keep their shape and their place about the centre, and narrowing them
+// again squeezed the menu to k * k of its width and, with its median right of the centre, moved it to the right edge.
+// ui_cam is the last camera block bound on the output target, 0 after a change of target.
+static _Thread_local uint64_t ui_cam;
 
 static void ui_note_target(const tex_t *t) {
     unsigned out[2], scene[2];
     res_sizes(out, scene);
     ui_on_output = t && t->d.width == out[0] && t->d.height == out[1];
     ui_in_rect = 0;
+    ui_cam = 0;
 }
 
 // The return address saved in the guest frame at fp, or 0. The guest stack page is asked about once per thread and page:
@@ -833,13 +873,23 @@ static float ui_shift(uint64_t node, float lo, float hi, float k) {
     return seen[i].side < 0 ? k - 1 : seen[i].side > 0 ? 1 - k : 0;
 }
 
+// The camera block (ui_cam): 4x4, bound by the same wrapper as the elements' transforms.
+static void ui_note_cam(const Cpu *c, int st, uint64_t addr, uint64_t size) {
+    if (res_ui_fit() >= 1 || !ui_on_output || st != 0 || c->x[30] != UI_BIND_RET) return;
+    ui_cam = size >= 0x40 ? addr : 0;
+}
+
 static void ui_fit(const Cpu *c, int st, uint64_t addr, uint64_t size) {
     static _Thread_local struct { uint64_t addr; float x; } done[64];
     float k = res_ui_fit();
     if (k >= 1 || !ui_on_output || ui_in_rect || st != 0 || c->x[30] != UI_BIND_RET || size < 0x80 || size > 0x400 ||
         ui_frame_lr(c->x[29]) != UI_BIND_LR)
         return;
-    // The block is read as is, as the uniform snapshots do: it lies in the game's memory.
+    // The blocks are read as they are, as the uniform snapshots do: they lie in the game's memory.
+    if (ui_cam) {   // a camera whose w row takes z is a perspective one: the element is placed for this frame already
+        const float *p = (const float *)(uintptr_t)ui_cam;
+        if (p[12] != 0 || p[13] != 0 || p[14] != 0) return;
+    }
     float *f = (float *)(uintptr_t)addr;
     if (f[2] != 0 || f[6] != 0 || f[8] != 0 || f[9] != 0 || f[10] != 0 || f[11] != 0) return;
     unsigned slot = (unsigned)(addr >> 4) % 64;   // a block bound for a second draw is narrow already
@@ -849,9 +899,14 @@ static void ui_fit(const Cpu *c, int st, uint64_t addr, uint64_t size) {
     // that wide: they carry their shape in the vertices, in units of the canvas width on both axes, so the matrix's rows
     // keep the canvas's 16:9 ratio, turned for spinning ones (the minimap's ring and compass). Those narrow like the rest,
     // placed by their origin. The same rule in XCX: xcx-recomp nvn_api_cmd.c ui_fit.
+    // The screen fades and dim layers (the title's fade-out, cutscene fades to and from black, the purple tint of a
+    // field event) have that shape too, a quad of the whole canvas in canvas units, and their origin is the canvas's
+    // top left corner. Narrowed from that corner they stopped short of the right side of a wide frame (#68), so an
+    // unturned element placed at the corner keeps its full reach.
     if (fabsf(f[0]) >= UI_FULL_WIDTH || (hi - lo >= 1 && (lo <= -0.99f || hi >= 0.99f))) {
         float rx = hypotf(f[0], f[1]), ry = hypotf(f[4], f[5]);
         if (!(rx > 0) || fabsf(ry / rx - 16.0f / 9.0f) > 0.02f) return;
+        if (f[1] == 0 && f[4] == 0 && f[0] > 0 && f[5] < 0 && fabsf(f[3] + 1) < 0.001f && fabsf(f[7] - 1) < 0.001f) return;
         lo = hi = f[3];
     }
     float shift = ui_shift(ui_node(c), lo, hi, k);
@@ -882,6 +937,7 @@ static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n
     int st = (int)arg_x(c, 1), first = (int)arg_x(c, 2), n = (int)arg_x(c, 3);
     const NVNbufferRange *rg = arg_p(c, 4);
     for (int i = 0; i < n; i++) {
+        if (op == OP_BIND_UBO && first + i == 1) ui_note_cam(c, st, rg[i].address, rg[i].size);
         if (op == OP_BIND_UBO && first + i == 0) ui_fit(c, st, rg[i].address, rg[i].size);
         *REC(o, op, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
         hw_fix(o, 20);
@@ -889,6 +945,7 @@ static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n
 }
 static void bind_buffer(const Cpu *c, uint32_t op) {    // (cmd, stage, index, NVNbufferAddress address, size_t size)
     cmd_t *o = cmd_of(c);
+    if (op == OP_BIND_UBO && arg_x(c, 2) == 1) ui_note_cam(c, (int)arg_x(c, 1), arg_x(c, 3), arg_x(c, 4));
     if (op == OP_BIND_UBO && arg_x(c, 2) == 0) ui_fit(c, (int)arg_x(c, 1), arg_x(c, 3), arg_x(c, 4));
     *REC(o, op, p_bind_buf) = (p_bind_buf){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
     hw_fix(o, 20);
